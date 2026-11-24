@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -23,8 +24,7 @@ from vision_uncertainty import (
 )
 
 H_CONFLICT = float(
-    predictive_entropy(np.array([0.5, 0.5]))
-    - predictive_entropy(np.array([[0.9, 0.1], [0.1, 0.9]])).mean()
+    predictive_entropy(np.array([0.5, 0.5])) - predictive_entropy(np.array([[0.9, 0.1], [0.1, 0.9]])).mean()
 )
 
 
@@ -39,8 +39,19 @@ def test_module_has_no_heavy_imports():
             roots.add(node.module.split(".")[0])
     forbidden = {"torch", "probly", "jax", "sklearn", "PIL", "cv2", "torchvision"}
     assert not roots & forbidden
-    allowed = {"__future__", "sys", "types", "dataclasses", "typing", "numpy", "scipy", "shapiq"}
+    allowed = {
+        "__future__",
+        "sys",
+        "types",
+        "dataclasses",
+        "typing",
+        "numpy",
+        "scipy",
+        "shapiq",
+        "skimage",
+    }
     assert roots <= allowed
+    assert "skimage" not in sys.modules  # optional SLIC import stays lazy
 
 
 # ----------------------------- measures ---------------------------------- #
@@ -214,9 +225,7 @@ def test_budgeted_approximation_finds_corner_conflict():
         p = 0.5 + 0.4 * (a & b)[:, None] * np.array([[1.0, -1.0]])
         return np.stack([p, 1.0 - p], axis=-1)
 
-    approx = explain_uncertainty(
-        img, corner_conflict, grid_shape=(4, 4), baseline="zeros", budget=2000, random_state=1
-    )
+    approx = explain_uncertainty(img, corner_conflict, grid_shape=(4, 4), baseline="zeros", budget=2000, random_state=1)
     assert not approx.exact
     i, j, val = approx.top_interactions(1)[0]
     assert (i, j) == (0, 15)
@@ -257,3 +266,29 @@ def test_first_order_image_shape(conflict_image, conflict_predict_fn):
 
 def test_conflict_strength_constant_sane():
     assert 0 < CONFLICT_STRENGTH < 0.5
+
+
+def test_slic_uses_contiguous_dynamic_players():
+    pytest.importorskip("skimage.segmentation")
+    yy, xx = np.mgrid[:64, :64]
+    image = np.stack((xx / 63, yy / 63, ((xx // 16 + yy // 16) % 2)), axis=-1).astype(float)
+
+    def predict(images):
+        p = 0.2 + 0.6 * images.mean(axis=(1, 2, 3))
+        one_member = np.stack((p, 1 - p), axis=-1)
+        return np.repeat(one_member[:, None, :], 2, axis=1)
+
+    explanation = explain_uncertainty(
+        image,
+        predict,
+        segmentation="slic",
+        n_segments=8,
+        compactness=10,
+        measure="total",
+        budget=32,
+        batch_size=8,
+    )
+    labels = explanation.grid.label_map()
+    assert np.array_equal(np.unique(labels), np.arange(explanation.grid.n_players))
+    assert explanation.first_order.shape == (explanation.grid.n_players,)
+    assert explanation.first_order_image().shape == image.shape[:2]

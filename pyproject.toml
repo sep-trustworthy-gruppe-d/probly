@@ -62,6 +62,9 @@ source = "https://github.com/pwhofman/probly"
 tracker = "https://github.com/pwhofman/probly/issues"
 changelog = "https://github.com/pwhofman/probly/blob/main/CHANGELOG.md"
 
+[project.optional-dependencies]
+slic = ["scikit-image>=0.23"]
+
 
 [dependency-groups]
 torch = [

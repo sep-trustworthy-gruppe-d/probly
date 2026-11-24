@@ -11,7 +11,7 @@ effect ``phi_i`` from the pairwise conflict ``phi_{i,j}``.
 
 Design
 ------
-* Players are the cells of a regular ``rows x cols`` patch grid.
+* Players are cells of a regular grid or regions from SLIC superpixels.
 * A coalition keeps its patches and replaces all other patches by a baseline.
 * The model is any callable ``predict_fn(images) -> probs`` with
   ``images`` of shape ``(B, H, W, C)`` and ``probs`` of shape
@@ -19,8 +19,8 @@ Design
   samples, credal vertices, ...) over ``K`` classes per image.
 * The game value is a scalar uncertainty measure of those ``M`` vectors.
 
-This module is model-agnostic: it only depends on the standard library,
-``numpy``, ``scipy`` and ``shapiq`` (no torch / probly / PIL / sklearn).
+This module is model-agnostic and does not require torch, probly, PIL, or sklearn.
+SLIC segmentation lazily imports the optional ``scikit-image`` dependency.
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ import shapiq  # noqa: E402
 
 __all__ = [
     "PatchGrid",
+    "SegmentMap",
     "UncertaintyExplanation",
     "UncertaintyGame",
     "UncertaintyMeasure",
@@ -58,9 +59,8 @@ __all__ = [
     "upsample_to_image",
 ]
 
-UncertaintyMeasure = Literal[
-    "total", "aleatoric", "epistemic", "credal_width", "credal_volume", "target_probability"
-]
+UncertaintyMeasure = Literal["total", "aleatoric", "epistemic", "credal_width", "credal_volume", "target_probability"]
+Segmentation = Literal["grid", "slic"]
 PredictFn = Callable[[np.ndarray], np.ndarray]
 _EPS = 1e-12
 
@@ -168,6 +168,53 @@ class PatchGrid:
         """Row / column of a player index."""
         return divmod(player, self.n_cols)
 
+    def label_map(self) -> np.ndarray:
+        """Return a pixel map containing each grid player's index."""
+        labels = np.empty((self.height, self.width), dtype=int)
+        for player, (rows, cols) in enumerate(self.slices):
+            labels[rows, cols] = player
+        return labels
+
+
+@dataclass(frozen=True)
+class SegmentMap:
+    """A contiguous, integer-labeled image partition such as SLIC superpixels."""
+
+    labels: np.ndarray
+
+    def __post_init__(self) -> None:
+        labels = np.asarray(self.labels, dtype=int)
+        if labels.ndim != 2 or labels.size == 0:
+            msg = f"Expected a 2-D segment map, got shape {labels.shape}."
+            raise ValueError(msg)
+        ids = np.unique(labels)
+        if not np.array_equal(ids, np.arange(len(ids))):
+            msg = "Segment IDs must be contiguous and start at zero."
+            raise ValueError(msg)
+        object.__setattr__(self, "labels", labels)
+
+    @property
+    def height(self) -> int:
+        return self.labels.shape[0]
+
+    @property
+    def width(self) -> int:
+        return self.labels.shape[1]
+
+    @property
+    def n_players(self) -> int:
+        return int(self.labels.max()) + 1
+
+    def player_names(self) -> list[str]:
+        return [f"segment_{player}" for player in range(self.n_players)]
+
+    def label_map(self) -> np.ndarray:
+        """Return the pixel labels used as the players' segmentation map."""
+        return self.labels
+
+
+ImageSegmentation = PatchGrid | SegmentMap
+
 
 def _make_baseline(image: np.ndarray, baseline: str | float | np.ndarray) -> np.ndarray:
     if isinstance(baseline, str):
@@ -191,21 +238,30 @@ def _make_baseline(image: np.ndarray, baseline: str | float | np.ndarray) -> np.
 
 def mask_image(
     image: np.ndarray,
-    grid: PatchGrid,
+    grid: ImageSegmentation,
     coalition: np.ndarray,
     baseline_image: np.ndarray,
 ) -> np.ndarray:
     """Keep patches where ``coalition`` is True, fill the rest from ``baseline_image``."""
     out = baseline_image.copy()
-    for keep, (rs, cs) in zip(coalition, grid.slices, strict=True):
-        if keep:
-            out[rs, cs] = image[rs, cs]
+    if isinstance(grid, PatchGrid):
+        for keep, (rows, cols) in zip(coalition, grid.slices, strict=True):
+            if keep:
+                out[rows, cols] = image[rows, cols]
+        return out
+    selected = coalition[grid.labels]
+    out[selected] = image[selected]
     return out
 
 
-def upsample_to_image(values: np.ndarray, grid: PatchGrid) -> np.ndarray:
+def upsample_to_image(values: np.ndarray, grid: ImageSegmentation) -> np.ndarray:
     """Paint a ``(n_rows, n_cols)`` array onto an ``(H, W)`` canvas (for heat-map overlays)."""
     values = np.asarray(values, dtype=float)
+    if isinstance(grid, SegmentMap):
+        if values.size != grid.n_players:
+            msg = f"Expected {grid.n_players} segment values, got shape {values.shape}."
+            raise ValueError(msg)
+        return values.reshape(-1)[grid.labels]
     if values.shape != (grid.n_rows, grid.n_cols):
         msg = f"Expected shape {(grid.n_rows, grid.n_cols)}, got {values.shape}."
         raise ValueError(msg)
@@ -229,7 +285,7 @@ class UncertaintyGame(shapiq.Game):
         self,
         image: np.ndarray,
         predict_fn: PredictFn,
-        grid: PatchGrid,
+        grid: ImageSegmentation,
         measure: UncertaintyMeasure = "epistemic",
         baseline: str | float | np.ndarray = "mean",
         batch_size: int = 16,
@@ -301,9 +357,7 @@ class UncertaintyGame(shapiq.Game):
         missing = list(dict.fromkeys(key for key in keys if key not in self.cache))
         for start in range(0, len(missing), self.batch_size):
             chunk = missing[start : start + self.batch_size]
-            batch = np.stack(
-                [mask_image(self.image, self.grid, rows[key], self.baseline_image) for key in chunk]
-            )
+            batch = np.stack([mask_image(self.image, self.grid, rows[key], self.baseline_image) for key in chunk])
             probs = np.asarray(self.predict_fn(batch), dtype=float)
             if probs.ndim != 3 or probs.shape[0] != len(chunk):
                 msg = (
@@ -328,7 +382,7 @@ class UncertaintyExplanation:
     """Result of :func:`explain_uncertainty`.
 
     Attributes:
-        grid: The patch grid (players are row-major).
+        grid: The grid or contiguous segment map defining the players.
         measure: Explained uncertainty measure.
         first_order: ``(n_rows, n_cols)`` individual attributions ``phi_i``.
         interactions: Symmetric ``(n, n)`` matrix of pairwise ``phi_{i,j}`` (zero diagonal).
@@ -337,7 +391,7 @@ class UncertaintyExplanation:
         exact: Whether values were computed exactly (vs. approximated with a budget).
     """
 
-    grid: PatchGrid
+    grid: ImageSegmentation
     measure: str
     first_order: np.ndarray
     interactions: np.ndarray
@@ -353,7 +407,9 @@ class UncertaintyExplanation:
         return sorted(pairs, key=key, reverse=True)[:k]
 
     def interaction_map(self, player: int) -> np.ndarray:
-        """``(n_rows, n_cols)`` map of interactions of one patch with all others."""
+        """Return the player's interactions as a grid or segment vector."""
+        if isinstance(self.grid, SegmentMap):
+            return self.interactions[player]
         return self.interactions[player].reshape(self.grid.n_rows, self.grid.n_cols)
 
     def first_order_image(self) -> np.ndarray:
@@ -373,6 +429,9 @@ def explain_uncertainty(
     random_state: int | None = 0,
     target_class: int | None = None,
     cache: dict[bytes, np.ndarray] | None = None,
+    segmentation: Segmentation = "grid",
+    n_segments: int = 16,
+    compactness: float = 10.0,
 ) -> UncertaintyExplanation:
     """Explain the uncertainty of ``predict_fn`` on ``image`` with ``k-SII`` (``max_order=2``).
 
@@ -387,6 +446,9 @@ def explain_uncertainty(
         random_state: Seed for the approximator.
         target_class: Class index required for ``measure="target_probability"``.
         cache: Optional per-image prediction cache, shareable across measures.
+        segmentation: Use the existing regular grid or SLIC superpixels.
+        n_segments: Requested SLIC segment count; the actual count can differ.
+        compactness: SLIC compactness parameter.
 
     Returns:
         An :class:`UncertaintyExplanation`.
@@ -395,7 +457,32 @@ def explain_uncertainty(
     if image.ndim != 3:
         msg = f"Expected image of shape (H, W, C), got {image.shape}."
         raise ValueError(msg)
-    grid = PatchGrid(image.shape[0], image.shape[1], *grid_shape)
+    if segmentation == "grid":
+        grid: ImageSegmentation = PatchGrid(image.shape[0], image.shape[1], *grid_shape)
+    elif segmentation == "slic":
+        if n_segments < 1:
+            msg = "n_segments must be at least 1."
+            raise ValueError(msg)
+        if compactness <= 0:
+            msg = "compactness must be positive."
+            raise ValueError(msg)
+        try:
+            from skimage.segmentation import slic
+        except ImportError as exc:
+            msg = "SLIC segmentation requires scikit-image; install it with 'pip install scikit-image'."
+            raise ImportError(msg) from exc
+        raw_labels = slic(
+            image,
+            n_segments=n_segments,
+            compactness=compactness,
+            start_label=0,
+            channel_axis=-1,
+        )
+        _, labels = np.unique(raw_labels, return_inverse=True)
+        grid = SegmentMap(labels.reshape(image.shape[:2]))
+    else:
+        msg = f"Unknown segmentation '{segmentation}'. Use 'grid' or 'slic'."
+        raise ValueError(msg)
     game = UncertaintyGame(
         image,
         predict_fn,
@@ -407,12 +494,13 @@ def explain_uncertainty(
         cache=cache,
     )
     n = grid.n_players
+    max_order = min(2, n)
 
     exact = budget is None or budget >= 2**n
     if exact:
-        iv = shapiq.ExactComputer(game)(index="k-SII", order=2)
+        iv = shapiq.ExactComputer(game)(index="k-SII", order=max_order)
     else:
-        approximator = shapiq.KernelSHAPIQ(n=n, max_order=2, index="k-SII", random_state=random_state)
+        approximator = shapiq.KernelSHAPIQ(n=n, max_order=max_order, index="k-SII", random_state=random_state)
         iv = approximator.approximate(budget, game)
 
     first = np.array([iv[(i,)] for i in range(n)], dtype=float)
@@ -422,10 +510,12 @@ def explain_uncertainty(
             pair[i, j] = pair[j, i] = iv[(i, j)]
 
     full = float(game(np.ones((1, n), dtype=bool))[0])
+    if isinstance(grid, PatchGrid):
+        first = first.reshape(grid.n_rows, grid.n_cols)
     return UncertaintyExplanation(
         grid=grid,
         measure=measure,
-        first_order=first.reshape(grid.n_rows, grid.n_cols),
+        first_order=first,
         interactions=pair,
         interaction_values=iv,
         full_value=full,
