@@ -1,0 +1,14 @@
+# Ruff settings for this folder: the repository settings, plus the same exceptions that probly uses for
+# its own tests (assert, missing docstrings, magic numbers) and print statements in the scripts.
+extend = "../../../pyproject.toml"
+
+[lint.extend-per-file-ignores]
+"tests/*.py" = ["S101", "INP001", "D100", "D101", "D102", "D103", "ANN001", "ANN201", "PLR2004", "TC", "SLF001"]
+"scripts/*.py" = ["INP001", "T201"]
+# Notebooks: German typography in texts (×, −, –), imports after adding the package folder to sys.path,
+# IPython's `display`, property checks with `assert` (as in the tests), and PD011, which mistakes the field
+# `UncertaintyExplanation.values` (a dict of shapiq results) for pandas' `.values`.
+"*.ipynb" = [
+    "RUF001", "E402", "I001", "A004", "PLC0206", "T20", "D103", "NPY002", "ERA001", "TRY003", "EM101", "EM102",
+    "S101", "PD011",
+]
