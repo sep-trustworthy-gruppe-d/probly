@@ -12,7 +12,7 @@ der Aufteilung aus Dans VGG16-Reihe (Branch `dan/oxford-pets-vgg16`).
 
 - **Das Paket funktioniert.** `UncertaintyExplainer` ist ein echter `shapiq.Explainer`. Er erklärt für jedes Bild
   die Vorhersage (P) und ihre Unsicherheit (TU, AU, EU) eines beliebigen probly-Modells: Ensemble, MC Dropout oder
-  ein Ensemble aus zwei verschiedenen Transformern. Effizienz und φ(TU) = φ(AU) + φ(EU) gelten, 20 Tests sind grün.
+  ein Ensemble aus zwei verschiedenen Transformern. Effizienz und φ(TU) = φ(AU) + φ(EU) gelten, 31 Tests sind grün.
 - **Zwei verschiedene Netze zeigen mehr fehlendes Wissen.** Das gemischte Ensemble (ViT + DINOv2) hat 2,5-mal so viel
   EU wie Köpfe nur auf dem ViT; 73 % davon entstehen **zwischen** den Netzen. Das bestätigt, was wir bei DermaMNIST
   gesehen haben.
@@ -25,6 +25,10 @@ der Aufteilung aus Dans VGG16-Reihe (Branch `dan/oxford-pets-vgg16`).
   so groß wie die Einzelbeiträge, bei P nur anderthalbmal.
 - **EU erkennt sichere Fehler nicht.** Ein Staffordshire Bull Terrier wird mit 96 % als American Bulldog vorhergesagt,
   bei einer EU von nur 0,010 nats.
+- **Ground Truth: Die Paare stimmen.** Auf Testbildern mit eingebauter Ursache (03-3) zeigt eine Chimäre (Kopf von
+  Rasse A auf dem Körper von Rasse B) fehlendes Wissen genau als Paar Kopf × Körper (+0,104 gegen −0,002 bei der
+  Kontrolle). Ein fremdes Schachbrett macht das Modell dagegen unsicher, aber als **Rauschen**: Alle Mitglieder sagen
+  gemeinsam „keine Ahnung“. EU ist hier also kein Alarm für Fremdes.
 - **ViT Shapley für Unsicherheit** liefert alle vier Karten in einem Durchlauf, etwa 250-mal schneller als KernelSHAP
   mit 256 Koalitionen. Für TU und AU ist er schon genauer als KernelSHAP 256, für P und EU noch nicht. Die Lernkurve
   zeigt: Mehr Trainings-Koalitionen verbessern P und EU.
@@ -63,7 +67,7 @@ plot_prediction_and_uncertainty(explanation)  # 4. Erklärung von beidem
 
 | Datei | Inhalt |
 |---|---|
-| `vit_uncertainty/data.py` | Oxford-IIIT Pet mit Dans Splits, Bildausschnitt und Kohorten |
+| `vit_uncertainty/data.py` | Oxford-IIIT Pet mit Dans Splits, Bildausschnitt, Kohorten und Kopf-Rahmen |
 | `vit_uncertainty/backbones.py` | `FrozenViT`: eingefrorener Transformer, der Patch-Tokens ausblenden kann |
 | `vit_uncertainty/players.py` | Spieler: SLIC-Superpixel (wie Tom) oder Raster, Zuordnung zu Tokens |
 | `vit_uncertainty/probly_bridge.py` | Köpfe trainieren, probly-Methoden bauen (auch gemischte Ensembles) |
@@ -73,6 +77,7 @@ plot_prediction_and_uncertainty(explanation)  # 4. Erklärung von beidem
 | `vit_uncertainty/plot.py` | Vorhersage und Unsicherheit nebeneinander, Paare, Vergleiche |
 | `vit_uncertainty/amortized.py` | `AmortizedUncertaintyExplainer`: ViT Shapley für Unsicherheit |
 | `vit_uncertainty/features.py` | Caches für Merkmale, maskierte Trainingsdaten und Koalitionen |
+| `vit_uncertainty/ground_truth.py` | Testbilder mit bekannter Ursache (Muster, zwei Rassen, Chimäre), grobe Spieler, Kennzahlen |
 | `vit_uncertainty/settings.py` | alle festen Einstellungen an einem Ort |
 | `tests/` | Tests mit kleinen Zufalls-Transformern (laufen in Sekunden, ohne Download) |
 | `scripts/benchmark.py` | misst die Geschwindigkeit deines Rechners und schätzt alle Laufzeiten |
@@ -81,6 +86,7 @@ plot_prediction_and_uncertainty(explanation)  # 4. Erklärung von beidem
 | `keith_03-0_vit-probly.ipynb` | Schritt 1 und 2: Daten, Transformer, Köpfe, probly-Methoden, F1 und F2 |
 | `keith_03-1_uncertainty-explainer.ipynb` | Schritt 3 und 4: der Explainer, Leitfrage, F3 bis F6 |
 | `keith_03-2_vit-shapley.ipynb` | Schritt 5: lernender Erklärer gegen KernelSHAP, F7 |
+| `keith_03-3_ground-truth.ipynb` | Ground Truth: Testbilder mit eingebauter Ursache, F8 bis F11 |
 | `figures/` | Abbildungen für die Präsentation |
 
 ## Ausführen
@@ -95,7 +101,7 @@ uv run python experiments/group-d_experiments/keith_03_vit_uncertainty/scripts/b
 uv run pytest experiments/group-d_experiments/keith_03_vit_uncertainty/tests -q                         # ca. 20 Sekunden
 ```
 
-Danach die Notebooks in der Reihenfolge 03-0, 03-1, 03-2 ausführen. Die Gewichte der beiden Transformer
+Danach die Notebooks in der Reihenfolge 03-0, 03-1, 03-2 ausführen; 03-3 (Ground Truth) braucht nur 03-0. Die Gewichte der beiden Transformer
 (ca. 180 MB) lädt `timm` beim ersten Lauf von Hugging Face. Alle Zwischenergebnisse liegen in
 `artifacts/keith-vit-uncertainty/` (nicht im Repository).
 
@@ -110,6 +116,8 @@ Danach die Notebooks in der Reihenfolge 03-0, 03-1, 03-2 ausführen. Die Gewicht
 | Erklärung aus dem Cache: Ensemble | ca. 0,2 s je Bild | P, TU, AU, EU mit Shapley-Werten und k-SII |
 | Erklärung aus dem Cache: MC Dropout | ca. 17 s je Bild | Bild für Bild mit festen Dropout-Masken |
 | Lernenden Erklärer trainieren | wenige Minuten | 40 Epochen |
+| Ground Truth (03-3): 180 exakte Erklärungen mit 2 oder 3 Spielern | ca. 2,5 min | 8 Koalitionen je Bild statt 1000 |
+| Ground Truth (03-3): 40 feine Erklärungen (16 SLIC-Superpixel, Budget 1000) | ca. 75 min | einmalig, danach Cache in `artifacts/keith-vit-uncertainty/ground_truth/` |
 | Lernender Erklärer: eine Erklärung | ca. 0,1 s: ein Lauf durch beide Netze, der Erklärer selbst höchstens etwa 1 ms | statt 1000 Läufen |
 
 Laufen mehrere Rechnungen gleichzeitig, teilen sie sich die Kerne und jede wird entsprechend langsamer.
@@ -131,7 +139,12 @@ Laufen mehrere Rechnungen gleichzeitig, teilen sie sich die Kerne und jede wird 
 | **64-Bit-Gleitkomma** | Sonst weicht TU = AU + EU um etwa 1e-7 ab (bei EU um 0,01 nicht vernachlässigbar). |
 | **Köpfe auch auf ausgeblendeten Bildern trainieren** („maskiert“) | Leichte Form des Ersatzmodells (Surrogat) aus ViT Shapley: Wer erklärt wird, sollte ausgeblendete Bilder kennen, sonst misst die Erklärung Verhalten außerhalb der Trainingsdaten. Wir vergleichen beide Varianten. |
 | **Lernender Erklärer klein und auf eingefrorenen Tokens** | Covert et al. trainieren einen ganzen ViT als Erklärer (GPU). Unsere Version ist ein kleiner Transformer auf den ViT-Tokens und lernt in Minuten auf der CPU. Dafür erklärt er vier Größen gleichzeitig und nutzt Superpixel. |
-| **Vorab festgelegte Fragen F1 bis F7 mit Regeln** | Damit wir nicht nachträglich die passende Geschichte suchen. Negative Ergebnisse werden genauso berichtet. |
+| **Vorab festgelegte Fragen F1 bis F11 mit Regeln** | Damit wir nicht nachträglich die passende Geschichte suchen. Negative Ergebnisse werden genauso berichtet. F8 bis F11 wurden am 25.11. mit Keith abgestimmt, bevor etwas gerechnet war. |
+| **Ground Truth mit selbst gebauten Testbildern** (03-3) | Bei echten Fotos weiß niemand, welcher Bildteil das Modell „wirklich“ unsicher macht. Bauen wir die Ursache selbst ein (Schachbrett, zwei Rassen, Chimäre), wissen wir, wo sie liegt, und können prüfen, ob die Erklärung sie findet. |
+| **Jedes Testbild hat eine Kontrolle** | Jede Konstruktion verändert das Bild auch anders (Flicken, Klebekante). Die Kontrolle hat dieselbe Konstruktion ohne die Ursache, z. B. einen Kopf derselben Rasse. Nur der Unterschied zählt. |
+| **Zwei Stufen: erst das Modell, dann die Erklärung** | Reagiert das Modell nicht auf die Ursache, kann auch keine Erklärung sie zeigen. Ohne diese Trennung hätten wir F8 als Fehler des Explainers gedeutet. |
+| **Grobe Spieler mit exakten Werten** (2 oder 3 Teile, aus denen das Bild gebaut ist) | Bei 4 oder 8 Koalitionen rechnet shapiq exakt. Die Ground Truth wird so nicht durch eine Näherung verwischt, und die Rechnung kostet Sekunden. Dazu prüfen 16 SLIC-Superpixel, ob auch die normale Pipeline die Ursache findet. |
+| **Quellbilder aus der Validierung, nur sicher erkannte** | Trainingsbilder kennt das Modell schon. Und nur wenn jeder Teil für sich klar „Rasse A“ sagt, ist die eingebaute Ursache die einzige. |
 
 ## Ergebnisse
 
@@ -144,6 +157,10 @@ Laufen mehrere Rechnungen gleichzeitig, teilen sie sich die Kerne und jede wird 
 | F5 | Übermalen statt Weglassen ändert die EU-Karte deutlich | **gestützt** | Median ρ EU = 0,35 (P: 0,72); v(∅) von P: 0,50 statt 0,03 | 03-1 |
 | F6 | Maskiertes Training ändert die EU-Karte deutlich | **nicht gestützt** | Median ρ = 0,71 | 03-1 |
 | F7 | Lernender Erklärer mindestens so genau wie KernelSHAP 256 (alle vier Größen) | **nicht gestützt** | relativer Fehler P 0,62 / TU 0,52 / AU 0,49 / EU 0,89 gegen 0,46 / 0,56 / 0,61 / 0,48 | 03-2 |
+| F8 | Feine EU-Karte (16 SLIC) setzt ein fremdes Schachbrett in ≥ 50 % der Bilder auf Platz 1, öfter als bei der Kontrolle | **nicht gestützt** | Treffer 20 % (Kontrolle 15 %, Zufall 6 %); das Modell reagiert kaum (ΔEU +0,0003 nats) | 03-3 |
+| F9 | Zwei Rassen in einem Bild: AU-Paar links × rechts in ≥ 80 % positiv und über der Kontrolle | **gestützt** | positiv 100 %; Median +3,584 gegen +3,036 (auch die Kontrolle ist immer positiv) | 03-3 |
+| F10 | Chimäre: EU-Paar Kopf × Körper in ≥ 2/3 positiv und über der Kontrolle | **gestützt** | positiv 73 %; Median +0,1042 gegen −0,0019 | 03-3 |
+| F11 | EU-Anteil am Paar bei Chimären größer als bei zwei Rassen | **nicht gestützt** | Median 0,039 gegen 0,065 | 03-3 |
 
 Weitere Zahlen:
 - **Vorhersage:** ViT allein 93,2 %, gemischtes Ensemble 95,0 % Accuracy (Dan mit VGG16: 89,9 bis 90,1 %).
@@ -173,6 +190,11 @@ Weitere Zahlen:
 4. **Grenze von EU:** Die gefährlichsten Fehler sind sichere Verwechslungen. Dort sind sich alle Mitglieder einig, und
    EU ist klein. Solche Fehler findet hier keines unserer Maße. Für „Soll ein Mensch nachsehen?“ ist `1 − max(p)`
    im Mittel trotzdem besser als EU (Error-AUROC 0,91 bis 0,93 gegen 0,87 bis 0,91).
+5. **Ground Truth (03-3):** Bei einer Kombination, die das Modell nie gesehen hat (Chimäre), findet die Erklärung das
+   fehlende Wissen genau dort, wo wir es eingebaut haben, und zwar als **Paar** Kopf × Körper. Ein fremdes Muster landet
+   dagegen in der AU: Alle Mitglieder sagen gemeinsam „keine Ahnung“ (nur der Flicken sichtbar: TU 3,36, davon AU 3,18).
+   Und die Zerlegung trennt „Widerspruch“ (zwei Rassen) nicht von „nie gesehen“ (Chimäre); beide erhöhen AU und EU.
+   **Was als AU und was als EU zählt, entscheiden das Modell und seine Mitglieder, nicht unsere Geschichte über das Bild.**
 
 **Für unser Projekt**
 
@@ -186,10 +208,15 @@ Weitere Zahlen:
   Unsicherheits-Karten.
 - **Interaktionen lohnen sich für EU:** Bei EU sind die Paar-Beiträge zusammen dreimal so groß wie die Einzelbeiträge
   (bei P anderthalbmal). Toms Wahl von k-SII bis Ordnung 2 ist damit inhaltlich begründet.
+- **Prüfstand für den Explainer (03-3):** Testbilder mit eingebauter Ursache, exakte Spiele mit wenigen Spielern und
+  zwei Stufen (erst das Modell, dann die Erklärung). Der Prüfstand funktioniert mit jeder probly-Methode; der nächste
+  Schritt ist, ihn für weitere Methoden laufen zu lassen (Idee B1).
 - **Mögliches Endthema:** „Amortisierte Unsicherheitserklärungen“ (ViT Shapley für P, TU, AU, EU mit Superpixeln).
   Der Prototyp zeigt, dass es für TU und AU schon funktioniert; für P und EU braucht er mehr Trainingsdaten.
 - **Für die Präsentation** (in `figures/`): `ablauf.png` (der Ablauf), `fall_falsch.png` (sicherer Fehler, kaum EU),
-  `weglassen_gegen_uebermalen.png`, `methoden_eu.png`, `vit_shapley_genauigkeit_zeit.png`, `vit_shapley_lernkurve.png`.
+  `weglassen_gegen_uebermalen.png`, `methoden_eu.png`, `vit_shapley_genauigkeit_zeit.png`, `vit_shapley_lernkurve.png`,
+  `ground_truth_chimaere.png` (die EU-Karte färbt den Körper der Chimäre rot), `ground_truth_paare.png` (Test gegen
+  Kontrolle), `ground_truth_testbilder.png`, `ground_truth_muster.png`.
 
 **Nächste Schritte**
 
@@ -197,6 +224,8 @@ Weitere Zahlen:
   drei Notebooks neu ausführen (die Einstellung ändert auch die maskierten Köpfe, also alle Ergebnisse). Die Lernkurve
   lässt bessere Werte für P und EU erwarten. Außerdem: gepaarte Koalitionen wie bei Covert et al. (S zusammen mit
   seinem Komplement ziehen).
+- Den Ground-Truth-Prüfstand (03-3) mit weiteren probly-Methoden laufen lassen: Zeigen auch MC Dropout und eine Methode
+  ohne Mitglieder (z. B. Evidential) das Chimären-Paar? Die groben Spiele kosten nur Sekunden.
 - Mit den Betreuern klären: Ort im Code (D4), ob gemischte Ensembles als probly-Methode gewünscht sind, und welche
   Entfernung Standard sein soll.
 
@@ -211,8 +240,31 @@ Weitere Zahlen:
 - Der lernende Erklärer sieht nur 8 Koalitionen je Trainingsbild und arbeitet auf gemittelten Tokens je Superpixel;
   er ist ein Prototyp, kein fertiges Verfahren.
 - Dans Zahlen stammen aus seinen Notebooks (VGG16, 3 Köpfe); unsere Ensembles haben 6 Mitglieder.
+- Ground Truth (03-3): 30 Testbilder je Test (20 fein erklärt), nur die Hauptmethode. Die Testbilder sind künstlich
+  (Klebekanten, Hintergrund im Kopf-Rahmen); die Kontrollen gleichen das aus, aber nicht ganz. Die Validierungsbilder
+  dienten beim Training der Köpfe dem frühen Stoppen.
 
 ## Protokoll
+
+### 25.11.2026 · Ground Truth (Notebook 03-3)
+
+- **Was:** Neues Modul `vit_uncertainty/ground_truth.py` (Testbilder mit eingebauter Ursache, grobe Spieler,
+  Kennzahlen), `OxfordPets.load_head_box` in `data.py` (Kopf-Rahmen aus `annotations/xmls`, auf den 224-Pixel-Ausschnitt
+  gebracht), 11 neue Tests, Notebook `keith_03-3_ground-truth.ipynb`, vier Abbildungen `figures/ground_truth_*.png`.
+  Sonst wurde keine Datei geändert.
+- **Warum:** Größte Lücke für die Verteidigung war, dass wir nicht zeigen konnten, ob die Karten stimmen (Übergabe, Idee
+  A1).
+- **Ablauf:** Plan und Regeln F8 bis F11 mit Keith abgestimmt (25.11., 16:42), **dann** gerechnet. Zwei Regeln für die
+  Bildauswahl kamen vor der Rechnung dazu: Körper ≥ 10 % des Bildes (Nahaufnahmen haben keinen Körper) und jeder grobe
+  Spieler braucht Tokens in beiden Netzen.
+- **Geprüft:** Python 3.13, torch 2.15 (CPU), timm 1.0.31, shapiq 1.8.0, scikit-learn 1.9.1, probly `6508e31`. Alle
+  Caches wurden neu gebaut; Notebook 03-0 liefert dabei **dieselben Zahlen** wie am 24.11. (nur die gemessenen
+  Millisekunden je Bild schwanken). `pytest tests` (31 Tests grün), `ruff check` und `ruff format --check`; `ty` findet
+  im neuen Code keinen Fehler (die 41 alten Typfehler sind unverändert). Notebook 03-3 zweimal von oben ausgeführt
+  (zweiter Lauf aus dem Cache, gleiche Zahlen). Alle Zahlen in dieser README und in der Deutung von 03-3 mit den Ausgaben
+  abgeglichen.
+- **Ergebnis:** F9 und F10 gestützt, F8 und F11 nicht gestützt (siehe Ergebnisse).
+- **Offen:** Prüfstand mit weiteren probly-Methoden (B1).
 
 ### 24.11.2026 · Reihe 03 angelegt
 

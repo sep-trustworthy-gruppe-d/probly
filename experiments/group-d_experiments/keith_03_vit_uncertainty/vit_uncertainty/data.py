@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image
@@ -145,3 +146,51 @@ class OxfordPets:
             msg = f"Invalid trimap for {image_id}."
             raise ValueError(msg)
         return values
+
+    def load_head_box(self, image_id: str, *, min_inside: float = 0.9) -> tuple[int, int, int, int] | None:
+        """Load the head bounding box of the pet, moved into the coordinates of :meth:`load_crop`.
+
+        Oxford-IIIT Pet has a head box (``annotations/xmls``) for most ``trainval`` images (3686 files),
+        but none for the test images. The box is given in pixels of the original JPEG. We apply the same
+        resize (short side 256) and center crop (224) as :meth:`load_crop`, so the box lies on the pixels
+        the models see. The XML coordinates are 1-based; the shift of at most one pixel is ignored.
+
+        Args:
+            image_id: Image id, e.g. ``"Abyssinian_1"``.
+            min_inside: Smallest share of the box area that must lie inside the crop. Boxes cut off
+                by the center crop are rejected, because half a head is not a head.
+
+        Returns:
+            ``(x0, y0, x1, y1)`` in crop pixels (``x1``/``y1`` exclusive), or ``None`` if there is no box
+            or too little of it lies inside the crop.
+        """
+        path = self.folder / "annotations" / "xmls" / f"{image_id}.xml"
+        if not path.is_file():
+            return None
+        # The XML files are part of the official dataset download (trusted input).
+        box = ET.parse(path).getroot().find("object/bndbox")  # noqa: S314
+        if box is None:
+            return None
+        x0, y0, x1, y1 = (float(box.findtext(key) or "nan") for key in ("xmin", "ymin", "xmax", "ymax"))
+        with Image.open(self.image_path(image_id)) as raw:
+            width, height = raw.size
+        new_width, new_height = _resized_size(width, height)
+        left = round((new_width - CROP_SIZE) / 2)  # same rounding as torchvision's center_crop
+        top = round((new_height - CROP_SIZE) / 2)
+        sx, sy = new_width / width, new_height / height
+        moved = np.array([x0 * sx - left, y0 * sy - top, x1 * sx - left, y1 * sy - top])
+        clipped = np.clip(moved, 0, CROP_SIZE)
+        area = (moved[2] - moved[0]) * (moved[3] - moved[1])
+        inside = (clipped[2] - clipped[0]) * (clipped[3] - clipped[1])
+        if not np.isfinite(area) or area <= 0 or inside / area < min_inside:
+            return None
+        bx0, by0, bx1, by1 = (round(float(value)) for value in clipped)
+        return bx0, by0, bx1, by1
+
+
+def _resized_size(width: int, height: int) -> tuple[int, int]:
+    # Size after torchvision's resize(256) of a PIL image: the short side becomes 256 and the long
+    # side int(256 * long / short), exactly as in torchvision.transforms.functional.resize.
+    if width <= height:
+        return RESIZE_SIZE, int(RESIZE_SIZE * height / width)
+    return int(RESIZE_SIZE * width / height), RESIZE_SIZE

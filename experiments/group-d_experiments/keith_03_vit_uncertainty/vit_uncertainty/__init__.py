@@ -29,6 +29,7 @@ Modules:
 * :mod:`~vit_uncertainty.plot`: prediction and uncertainty side by side.
 * :mod:`~vit_uncertainty.amortized`: the learned explainer (ViT Shapley for uncertainty).
 * :mod:`~vit_uncertainty.features`: feature caches for the notebooks.
+* :mod:`~vit_uncertainty.ground_truth`: test images with a known cause (pattern, two breeds, chimera).
 """
 
 from .amortized import AmortizedUncertaintyExplainer
