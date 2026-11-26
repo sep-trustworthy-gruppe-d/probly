@@ -22,12 +22,18 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from PIL import Image
 from sklearn.model_selection import train_test_split
-from torchvision.transforms import InterpolationMode, functional as TF
+from torchvision.transforms import CenterCrop, InterpolationMode, Resize
 
 # The crop that every model in this package sees (identical to Dan's VGG16 preprocessing).
 RESIZE_SIZE = 256
 CROP_SIZE = 224
 SEED = 0
+
+# The transform classes call exactly torchvision's functional ``resize`` and ``center_crop``. We use the
+# classes because the type hints of the functions only name tensors, although they also take PIL images.
+_RESIZE_IMAGE = Resize(RESIZE_SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True)
+_RESIZE_TRIMAP = Resize(RESIZE_SIZE, interpolation=InterpolationMode.NEAREST)  # keeps the labels 1, 2, 3
+_CENTER_CROP = CenterCrop(CROP_SIZE)
 
 
 def default_data_root() -> Path:
@@ -129,8 +135,7 @@ class OxfordPets:
         """
         with Image.open(self.image_path(image_id)) as raw:
             rgb = raw.convert("RGB")
-        resized = TF.resize(rgb, RESIZE_SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True)
-        return np.asarray(TF.center_crop(resized, CROP_SIZE)).copy()
+        return np.asarray(_CENTER_CROP(_RESIZE_IMAGE(rgb))).copy()
 
     def load_trimap(self, image_id: str) -> np.ndarray:
         """Load the pet/background/border trimap aligned with :meth:`load_crop`.
@@ -140,8 +145,7 @@ class OxfordPets:
         """
         path = self.folder / "annotations" / "trimaps" / f"{image_id}.png"
         with Image.open(path) as raw:
-            resized = TF.resize(raw, RESIZE_SIZE, interpolation=InterpolationMode.NEAREST)
-            values = np.asarray(TF.center_crop(resized, CROP_SIZE)).astype(np.int64)
+            values = np.asarray(_CENTER_CROP(_RESIZE_TRIMAP(raw))).astype(np.int64)
         if values.shape != (CROP_SIZE, CROP_SIZE) or not np.isin(values, [1, 2, 3]).all():
             msg = f"Invalid trimap for {image_id}."
             raise ValueError(msg)

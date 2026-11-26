@@ -16,9 +16,17 @@ Two kinds of values per quantity, from the same coalitions:
 Cost control:
 
 * The four games share one :class:`~vit_uncertainty.removal.CoalitionFeatures` cache.
-* Every game uses the same approximator seed and budget. shapiq's samplers (KernelSHAP for SV and
-  KernelSHAPIQ for k-SII) then draw the **same coalitions**, so the transformers run once per coalition,
-  not eight times.
+* Every game uses the same approximator seed and budget. shapiq's regression samplers (KernelSHAP for
+  SV, KernelSHAPIQ for k-SII and SII, RegressionFSII for FSII) then draw the **same coalitions**, so the
+  transformers run once per coalition, not eight times.
+
+With few players (``budget >= 2**n``) every coalition is evaluated and shapiq computes the values
+**exactly** (``ExactComputer``); then any index works, also STII and Moebius.
+
+One deliberate difference to :class:`shapiq.Explainer`: ``explain`` returns an
+:class:`UncertaintyExplanation` (four ``InteractionValues`` at once) instead of a single
+``InteractionValues``. ``explain`` and ``explain_function`` say so in their type hints, so code that uses
+the explanation is checked correctly; the two places are marked for the type checker.
 
 Usage::
 
@@ -31,16 +39,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import shapiq
 import torch
-from torch import nn
 
 from .game import QUANTITIES, UncertaintyGame
 from .players import make_regions
 from .probly_bridge import uncertainty
 from .removal import CoalitionFeatures
+
+if TYPE_CHECKING:
+    from shapiq.explainer.custom_types import ExplainerIndices
+    from torch import nn
 
 
 @dataclass
@@ -120,7 +132,8 @@ class UncertaintyExplainer(shapiq.Explainer):
         n_players: Number of players (16 as in Tom's comparison).
         removal: ``"token"`` (hide patch tokens, default) or ``"fill"`` (paint pixels).
         fill: Fill for ``removal="fill"``: ``"blur"`` or ``"mean"``.
-        index: shapiq index, e.g. ``"k-SII"`` (default, as Tom) or ``"SV"``.
+        index: shapiq index: ``"k-SII"`` (default, as Tom), ``"SII"``, ``"FSII"`` or ``"SV"``; with exact
+            values (``budget >= 2**n_players``) also ``"STII"``, ``"Moebius"`` and the other exact indices.
         max_order: Highest interaction order (2 = pairs of regions).
         budget: Coalitions per game. If ``budget >= 2**n_players`` the values are exact. For k-SII up to
             order 2 it should clearly exceed the number of unknowns ``1 + n + n(n-1)/2`` (137 for 16
@@ -142,7 +155,7 @@ class UncertaintyExplainer(shapiq.Explainer):
         n_players: int = 16,
         removal: str = "token",
         fill: str = "blur",
-        index: str = "k-SII",
+        index: ExplainerIndices = "k-SII",
         max_order: int = 2,
         budget: int = 1000,
         num_samples: int = 50,
@@ -180,26 +193,45 @@ class UncertaintyExplainer(shapiq.Explainer):
     # ----------------------------------------------------------------- explanation
 
     def _interaction_values(
-        self, game: UncertaintyGame, budget: int, *, index: str | None = None
+        self, game: UncertaintyGame, budget: int, *, index: ExplainerIndices | None = None
     ) -> shapiq.InteractionValues:
         index = self.index if index is None else index
         order = 1 if index == "SV" else self.max_order
         n = game.n_players
         if budget >= 2**n:
-            # Few players: evaluate every coalition and compute exact values.
+            # Few players: evaluate every coalition and compute exact values (any index).
             return shapiq.ExactComputer(game, n_players=n)(index=index, order=order)
-        if index == "SV":
-            approximator = shapiq.approximator.KernelSHAP(n, random_state=self.random_state)
-        else:
-            approximator = shapiq.approximator.KernelSHAPIQ(
-                n, max_order=order, index=index, random_state=self.random_state
-            )
+        # These approximators all draw their coalitions with the same sampler, so for the same seed and
+        # budget they ask for the same coalitions (one cache serves all of them).
+        match index:
+            case "SV":
+                approximator = shapiq.approximator.KernelSHAP(n, random_state=self.random_state)
+            case "k-SII" | "SII":
+                approximator = shapiq.approximator.KernelSHAPIQ(
+                    n, max_order=order, index=index, random_state=self.random_state
+                )
+            case "FSII":
+                approximator = shapiq.approximator.RegressionFSII(n, max_order=order, random_state=self.random_state)
+            case _:
+                msg = f"No approximator for {index!r} here; use k-SII, SII, FSII or SV, or budget >= 2**{n} (exact)."
+                raise ValueError(msg)
         return approximator.approximate(budget=budget, game=game)
 
-    def explain_function(  # type: ignore[override]
+    # shapiq's Explainer.explain and explain_function return one InteractionValues. Ours return four at
+    # once (UncertaintyExplanation), which is the point of this explainer. The parameters are compatible;
+    # only the return type differs, and that is the one deliberate exception marked for ty.
+    def explain(  # ty: ignore[invalid-method-override]
         self,
-        x: np.ndarray,
-        *,
+        x: np.ndarray | None = None,
+        **kwargs: Any,  # noqa: ANN401 (same signature as shapiq.Explainer.explain)
+    ) -> UncertaintyExplanation:
+        """Explain one image: prediction and TU/AU/EU (see :meth:`explain_function` for the arguments)."""
+        return self.explain_function(x=x, **kwargs)
+
+    def explain_function(  # ty: ignore[invalid-method-override]
+        self,
+        x: np.ndarray | None,
+        *args: object,  # noqa: ARG002
         regions: np.ndarray | None = None,
         budget: int | None = None,
         coalition_features: CoalitionFeatures | None = None,
@@ -209,6 +241,7 @@ class UncertaintyExplainer(shapiq.Explainer):
 
         Args:
             x: ``uint8`` RGB crop ``(224, 224, 3)``.
+            *args: Ignored (compatibility with :meth:`shapiq.Explainer.explain_function`).
             regions: Optional player map; by default built with ``players`` and ``n_players``.
             budget: Optional budget overriding the one given at construction.
             coalition_features: Optional existing cache for this image and these regions (lets several
@@ -218,6 +251,9 @@ class UncertaintyExplainer(shapiq.Explainer):
         Returns:
             :class:`UncertaintyExplanation` with one ``InteractionValues`` per quantity.
         """
+        if x is None:
+            msg = "UncertaintyExplainer needs an image to explain."
+            raise ValueError(msg)
         start = time.perf_counter()
         image = np.asarray(x)
         regions = make_regions(image, self.players, self.n_players) if regions is None else regions

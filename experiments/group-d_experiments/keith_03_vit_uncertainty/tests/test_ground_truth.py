@@ -158,3 +158,34 @@ def test_load_head_box_moves_box_into_crop(tmp_path: Path) -> None:
     # A box mostly outside the crop is rejected.
     (folder / "annotations" / "xmls" / "cat_1.xml").write_text(xml.replace(">150<", ">0<").replace(">250<", ">60<"))
     assert pets.load_head_box("cat_1") is None
+
+
+def test_superpixel_parts_takes_the_majority() -> None:
+    regions = np.array([[0, 0, 1, 1], [0, 0, 1, 1], [2, 2, 2, 2]])
+    parts = np.array([[0, 0, 0, 1], [0, 1, 1, 1], [2, 2, 2, 0]])
+    np.testing.assert_array_equal(gt.superpixel_parts(regions, parts), [0, 1, 2])
+
+
+def test_group_pair_sum_adds_the_pairs_between_two_groups() -> None:
+    pairs = np.array([[0.0, 1.0, 2.0, 4.0], [1.0, 0.0, 8.0, 16.0], [2.0, 8.0, 0.0, 32.0], [4.0, 16.0, 32.0, 0.0]])
+    groups = np.array([0, 0, 1, 2])
+    assert gt.group_pair_sum(pairs, groups, 0, 1) == 2.0 + 8.0
+    assert gt.group_pair_sum(pairs, groups, 1, 2) == 32.0
+    assert gt.group_pair_sum(pairs, np.array([0, 0, 0, 2]), 0, 1) == 0.0  # empty group: empty sum
+    with pytest.raises(ValueError, match="two different groups"):
+        gt.group_pair_sum(pairs, groups, 1, 1)
+
+
+def test_superpixel_patches_cut_out_each_player(image: np.ndarray) -> None:
+    from vit_uncertainty.plot import superpixel_patches  # noqa: PLC0415
+
+    regions = np.zeros(image.shape[:2], dtype=np.int64)
+    regions[:100, :50] = 1
+    patches = superpixel_patches(image, regions)
+    assert [patch.size for patch in patches] == [(224, 224), (50, 100)]  # PIL size is (width, height)
+    alpha = np.asarray(patches[0])[..., 3]
+    assert (alpha[:100, :50] == 0).all()
+    assert (alpha[100:, :] == 255).all()
+    framed = superpixel_patches(image, regions, frame_colors=["red", "blue"], frame=2)
+    assert framed[1].size == (54, 104)
+    assert tuple(np.asarray(framed[1])[0, 0]) == (0, 0, 255, 255)

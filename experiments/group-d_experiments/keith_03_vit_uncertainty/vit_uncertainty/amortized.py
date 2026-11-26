@@ -208,6 +208,9 @@ class AmortizedUncertaintyExplainer:
                     f"Epoche {epoch:3d} | Train {np.mean(losses):.4f} | Val {val_loss:.4f} | "
                     f"{time.perf_counter() - start:.0f} s"
                 )
+        if best_state is None:  # only possible if every validation loss was NaN
+            msg = "Training found no epoch with a finite validation loss."
+            raise RuntimeError(msg)
         self.net.load_state_dict(best_state)
         self.net.eval()
         return self.history

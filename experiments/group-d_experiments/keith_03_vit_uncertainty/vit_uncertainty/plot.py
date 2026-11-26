@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from matplotlib.colors import TwoSlopeNorm
+from matplotlib.colors import TwoSlopeNorm, to_rgb
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
 from .game import QUANTITY_NAMES_DE
 
@@ -147,3 +148,40 @@ def plot_comparison(
             title=f"{label}\n{SHORT_TITLES[quantity]}, v(N) = {explanation.full[quantity]:.3f}",
         )
     return fig
+
+
+def superpixel_patches(
+    image: np.ndarray, regions: np.ndarray, *, frame_colors: list[str] | None = None, frame: int = 4
+) -> list[Image.Image]:
+    """One small picture per player: its pixels cut out of ``image``, everything else transparent.
+
+    For shapiq's ``si_graph_plot(..., feature_image_patches=...)``: the nodes of the graph then show the
+    image parts they stand for. An optional coloured frame per player marks groups of players, e.g. the
+    head and body superpixels of a chimera.
+
+    Args:
+        image: ``uint8`` RGB image ``(H, W, 3)``.
+        regions: Player id per pixel ``(H, W)``.
+        frame_colors: Optional matplotlib colour per player for a frame around its picture.
+        frame: Width of the frame in pixels.
+
+    Returns:
+        A list of RGBA ``PIL.Image`` objects, one per player, each cropped to its player's bounding box.
+    """
+    patches = []
+    for player in range(int(regions.max()) + 1):
+        rows, cols = np.nonzero(regions == player)
+        top, bottom, left, right = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+        alpha = np.where(regions[top:bottom, left:right] == player, 255, 0).astype(np.uint8)
+        rgba = np.dstack([image[top:bottom, left:right], alpha])
+        if frame_colors is not None:
+            colour = (np.array(to_rgb(frame_colors[player])) * 255).astype(np.uint8)
+            padded = np.zeros((rgba.shape[0] + 2 * frame, rgba.shape[1] + 2 * frame, 4), dtype=np.uint8)
+            padded[..., :3], padded[..., 3] = colour, 255
+            inner = padded[frame:-frame, frame:-frame]
+            visible = rgba[..., 3] > 0
+            inner[visible] = rgba[visible]
+            inner[~visible] = (255, 255, 255, 255)  # white inside the frame where the player has no pixels
+            rgba = padded
+        patches.append(Image.fromarray(rgba))  # four uint8 channels: an RGBA picture
+    return patches

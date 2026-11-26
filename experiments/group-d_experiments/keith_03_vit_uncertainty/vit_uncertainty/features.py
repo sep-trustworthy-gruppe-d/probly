@@ -11,7 +11,8 @@ Three kinds of data are cached:
 2. **Masked training features**: for every training and validation image a few random coalitions of
    its 16 SLIC superpixels, hidden in token space. Heads trained on them have seen partial images,
    which is the idea of the "surrogate" model in ViT Shapley (Covert et al., 2023).
-3. **Explanation caches** of single images (all coalitions an explanation evaluated).
+3. **Explanation caches** of single images (all coalitions an explanation evaluated), as
+   :class:`DiskCoalitionFeatures`.
 """
 
 from __future__ import annotations
@@ -26,10 +27,10 @@ import numpy as np
 import torch
 
 from .players import make_regions, regions_to_tokens, token_coalition_mask
+from .removal import CoalitionFeatures
 
 if TYPE_CHECKING:
     from .data import OxfordPets
-    from .removal import CoalitionFeatures
 
 ARTIFACT_DIR = Path(__file__).resolve().parents[4] / "artifacts" / "keith-vit-uncertainty"
 
@@ -47,7 +48,7 @@ def load(path: Path) -> dict | None:
     return torch.load(path, map_location="cpu", weights_only=False) if path.is_file() else None
 
 
-def _ids_hash(ids: list[str]) -> str:
+def _ids_hash(ids: list[str] | list[int]) -> str:
     return hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
 
 
@@ -197,6 +198,48 @@ def masked_training_features(
     return payload
 
 
+class DiskCoalitionFeatures(CoalitionFeatures):
+    """:class:`~vit_uncertainty.removal.CoalitionFeatures` that keeps its coalitions in a file.
+
+    Stored coalitions are only reused if the stored manifest (image, players, removal, models) matches
+    exactly. :meth:`store` writes all coalitions back. This is a subclass on purpose: attaching
+    ``cache_path`` and ``manifest`` to a plain ``CoalitionFeatures`` object afterwards also works at run
+    time, but then no type checker can see these attributes.
+
+    Args:
+        image: ``uint8`` RGB crop ``(224, 224, 3)``.
+        regions: Player id per pixel ``(224, 224)``.
+        backbones: ``{name: FrozenViT}``.
+        cache_path: File of the cache.
+        manifest: Everything the features depend on; it is stored next to them.
+        removal: ``"token"`` or ``"fill"``.
+        fill: Fill for ``removal="fill"``.
+    """
+
+    def __init__(
+        self,
+        image: np.ndarray,
+        regions: np.ndarray,
+        backbones: dict,
+        *,
+        cache_path: Path,
+        manifest: dict,
+        removal: str = "token",
+        fill: str = "blur",
+    ) -> None:
+        """Set up the cache and load the stored coalitions if the manifest matches."""
+        super().__init__(image, regions, backbones, removal=removal, fill=fill)
+        self.cache_path = cache_path
+        self.manifest = manifest
+        stored = load(cache_path)
+        if stored is not None and stored["manifest"] == manifest:
+            self.load_state(stored)
+
+    def store(self) -> None:
+        """Write all coalitions (old and new) back to :attr:`cache_path`."""
+        save(self.cache_path, {"manifest": self.manifest, **self.state()})
+
+
 def coalition_cache(
     pets: OxfordPets,
     image_id: str,
@@ -206,23 +249,18 @@ def coalition_cache(
     n_players: int = 16,
     removal: str = "token",
     fill: str = "blur",
-) -> CoalitionFeatures:
-    """A :class:`~vit_uncertainty.removal.CoalitionFeatures` for one test image, pre-filled from disk.
+) -> DiskCoalitionFeatures:
+    """A :class:`DiskCoalitionFeatures` for one test image, pre-filled from disk.
 
     shapiq's approximators draw the same coalitions for the same seed, budget, and number of players,
     independent of the game values. So the transformer passes of an explanation can be computed once
     (e.g. by ``scripts/precompute.py``) and every later explanation of the same image, with any probly
     method, only reads them. Call :func:`save_coalition_cache` to write new coalitions back.
     """
-    from .players import make_regions  # noqa: PLC0415
-    from .removal import CoalitionFeatures  # noqa: PLC0415
-
     crop = pets.load_crop(image_id)
     regions = make_regions(crop, players, n_players)
-    cache = CoalitionFeatures(crop, regions, backbones, removal=removal, fill=fill)
     tag = f"{players}{n_players}_{removal}" + (f"-{fill}" if removal == "fill" else "")
-    cache.cache_path = ARTIFACT_DIR / "coalitions" / f"{image_id}_{tag}.pt"
-    cache.manifest = {
+    manifest = {
         "schema": 1,
         "image": image_id,
         "players": players,
@@ -232,12 +270,17 @@ def coalition_cache(
         "regions": hashlib.sha256(regions.tobytes()).hexdigest()[:16],
         "models": {key: b.model.pretrained_cfg.get("hf_hub_id", key) for key, b in backbones.items()},
     }
-    stored = load(cache.cache_path)
-    if stored is not None and stored["manifest"] == cache.manifest:
-        cache.load_state(stored)
-    return cache
+    return DiskCoalitionFeatures(
+        crop,
+        regions,
+        backbones,
+        cache_path=ARTIFACT_DIR / "coalitions" / f"{image_id}_{tag}.pt",
+        manifest=manifest,
+        removal=removal,
+        fill=fill,
+    )
 
 
-def save_coalition_cache(cache: CoalitionFeatures) -> None:
+def save_coalition_cache(cache: DiskCoalitionFeatures) -> None:
     """Write all coalitions of a cache from :func:`coalition_cache` back to disk."""
-    save(cache.cache_path, {"manifest": cache.manifest, **cache.state()})
+    cache.store()

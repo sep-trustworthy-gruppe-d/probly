@@ -1,0 +1,15 @@
+# ty settings for this folder (like ruff.toml next to it). The repository excludes experiments/ from ty,
+# so we check this folder on its own. From this folder:
+#
+#     uvx ty@0.0.110 check
+#
+# The probly stubs of the repository (stubs/, made by prek) are left out on purpose: they only describe
+# probly.method and probly.transformation, and code outside src/ then cannot find the other probly
+# modules. Without them ty reads probly directly from src/.
+
+[environment]
+python = "../../../.venv"
+extra-paths = ["."]
+
+[src]
+include = ["vit_uncertainty", "tests", "scripts"]

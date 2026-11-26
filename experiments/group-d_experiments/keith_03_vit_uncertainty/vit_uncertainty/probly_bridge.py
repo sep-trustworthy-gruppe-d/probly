@@ -10,7 +10,7 @@ Every probly predictor in this package reads the **same input**: the CLS feature
 backbones concatenated (``vit`` then ``dinov2``, 384 + 384 = 768 numbers). A member that belongs
 to one backbone cuts out its own block with :class:`FeatureSlice`. This makes members on
 *different* backbones possible inside one probly ensemble, which ``probly.method.ensemble``
-does not support directly (it copies one base model). We learned in the DermaMNIST series that
+does not support directly (it copies one base model). We learned in an earlier pilot study that
 exactly these mixed ensembles show epistemic uncertainty; heads on one frozen network hardly do.
 """
 
@@ -18,17 +18,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
 
+
+class HeadConfig(TypedDict):
+    """Training settings of one head (a plain ``dict`` at run time, so it can be stored in manifests)."""
+
+    dropout: float
+    batch_size: int
+    max_epochs: int
+    patience: int
+    learning_rate: float
+    weight_decay: float
+
+
 # Training settings of Dan's VGG16 heads, so that differences come from the backbone, not from tuning.
-HEAD_CONFIG = {
+HEAD_CONFIG: HeadConfig = {
     "dropout": 0.5,
     "batch_size": 64,
     "max_epochs": 30,
@@ -110,7 +124,7 @@ def train_head(
     train: tuple[torch.Tensor, torch.Tensor],
     val: tuple[torch.Tensor, torch.Tensor],
     *,
-    config: dict | None = None,
+    config: HeadConfig | None = None,
     seed: int = 0,
 ) -> dict:
     """Train one head with AdamW and keep the epoch with the lowest validation cross-entropy.
@@ -119,13 +133,14 @@ def train_head(
         head: Initialized head (trained in place).
         train: Training features and labels.
         val: Validation features and labels.
-        config: Settings; defaults to :data:`HEAD_CONFIG` (Dan's settings).
+        config: Settings; defaults to :data:`HEAD_CONFIG` (Dan's settings). To change one setting, pass
+            e.g. ``{**HEAD_CONFIG, "max_epochs": 10}``.
         seed: Seed for dropout masks and minibatch order.
 
     Returns:
         ``state_dict`` of the best epoch, ``best_epoch``, ``best_val_loss``, and the ``history``.
     """
-    config = HEAD_CONFIG | (config or {})
+    config = HEAD_CONFIG if config is None else config
     seed_all(seed)
     loader = DataLoader(
         TensorDataset(*train),
@@ -135,7 +150,9 @@ def train_head(
     )
     optimizer = torch.optim.AdamW(head.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     criterion = nn.CrossEntropyLoss()
-    best = {"state_dict": None, "best_epoch": 0, "best_val_loss": float("inf"), "history": []}
+    best_state: dict[str, torch.Tensor] | None = None
+    best_epoch, best_val_loss = 0, float("inf")
+    history: list[dict[str, float]] = []
     patience = 0
     for epoch in range(1, config["max_epochs"] + 1):
         head.train()
@@ -148,18 +165,21 @@ def train_head(
             logits = head(val[0])
             val_loss = criterion(logits, val[1]).item()
             val_acc = (logits.argmax(1) == val[1]).float().mean().item()
-        best["history"].append({"epoch": epoch, "val_loss": val_loss, "val_accuracy": val_acc})
-        if val_loss < best["best_val_loss"]:
-            best.update(best_val_loss=val_loss, best_epoch=epoch)
-            best["state_dict"] = {k: v.detach().clone() for k, v in head.state_dict().items()}
+        history.append({"epoch": epoch, "val_loss": val_loss, "val_accuracy": val_acc})
+        if val_loss < best_val_loss:
+            best_val_loss, best_epoch = val_loss, epoch
+            best_state = {k: v.detach().clone() for k, v in head.state_dict().items()}
             patience = 0
         else:
             patience += 1
             if patience >= config["patience"]:
                 break
-    head.load_state_dict(best["state_dict"])
+    if best_state is None:  # only possible if every validation loss was NaN
+        msg = "Training found no epoch with a finite validation loss."
+        raise RuntimeError(msg)
+    head.load_state_dict(best_state)
     head.eval()
-    return best
+    return {"state_dict": best_state, "best_epoch": best_epoch, "best_val_loss": best_val_loss, "history": history}
 
 
 def member(layout: FeatureLayout, backbone: str, state_dict: dict, *, dropout: float = 0.5) -> nn.Sequential:
@@ -171,26 +191,40 @@ def member(layout: FeatureLayout, backbone: str, state_dict: dict, *, dropout: f
     return nn.Sequential(FeatureSlice(backbone, start, end), *head).eval()
 
 
-def build_probly_ensemble(members: list[nn.Module]) -> nn.ModuleList:
+def as_logit_classifier[M: nn.Module](module: M) -> M:
+    """Tell probly that ``module`` returns logits (probly then applies the softmax itself).
+
+    This is exactly what probly's methods do with the keyword ``predictor_type="logit_classifier"``:
+    they register the model in probly's predictor registry. We call the registry directly, because that
+    keyword is added by a decorator at run time; a type checker sees it only in probly's generated stubs.
+    """
+    from probly.predictor import LogitClassifier  # noqa: PLC0415
+
+    return LogitClassifier.register_instance(module)
+
+
+def build_probly_ensemble(members: Sequence[nn.Module]) -> nn.ModuleList:
     """Wrap trained, possibly different members as one probly ensemble.
 
-    ``probly.method.ensemble`` builds ``num_members`` copies of one base model. We let probly build
-    that container (so that probly registers it as an ensemble predictor) and then put our trained
-    members into its slots, each registered as a logit classifier.
+    ``probly.method.ensemble`` builds ``num_members`` copies of **one** base model. Our members differ
+    (heads on different backbones), so we build the container the way probly's torch ensemble does it:
+    an ``nn.ModuleList``. probly treats every ``nn.ModuleList`` as an ensemble (``EnsemblePredictor``),
+    so its representer and ``quantify`` work as for ``ensemble(...)``; each member is registered as a
+    logit classifier. (Until 25.11. we let ``ensemble`` build copies and replaced them afterwards; the
+    results are identical, this way is simpler and needs no replacing.)
     """
-    from probly.method import cast, ensemble  # noqa: PLC0415
-
-    container = ensemble(members[0], num_members=len(members), reset_params=False, predictor_type="logit_classifier")
-    for index, module in enumerate(members):
-        container[index] = cast(module, predictor_type="logit_classifier")
-    return container.eval()
+    return nn.ModuleList([as_logit_classifier(module) for module in members]).eval()
 
 
 def build_probly_dropout(member_module: nn.Module, p: float = 0.5) -> nn.Module:
-    """MC Dropout with probly: the head's own dropout layer stays active at prediction time."""
+    """MC Dropout with probly: the head's own dropout layer stays active at prediction time.
+
+    Same as ``dropout(member_module, p=p, predictor_type="logit_classifier")``: the head is registered
+    as a logit classifier before the transformation and the result after it.
+    """
     from probly.method import dropout  # noqa: PLC0415
 
-    return dropout(member_module, p=p, predictor_type="logit_classifier").eval()
+    return as_logit_classifier(dropout(as_logit_classifier(member_module), p=p)).eval()
 
 
 def build_methods(
@@ -254,8 +288,12 @@ def uncertainty(
     probly draws one dropout mask per row and sample, so in a batch the masks of a row depend on its
     position. Row by row, every input (every image, every coalition) sees the same 50 masks. Then a
     game value v(S) is a fixed number and not a random draw, which Shapley values need.
+
+    Raises:
+        TypeError: If probly's decomposition is not additive. The explainer relies on TU = AU + EU (then
+            the explanations add up as well: phi(TU) = phi(AU) + phi(EU)).
     """
-    from probly.quantification import quantify  # noqa: PLC0415
+    from probly.quantification import AdditiveDecomposition, quantify  # noqa: PLC0415
 
     if is_sampling_method(predictor):
         batch_size = 1
@@ -263,6 +301,9 @@ def uncertainty(
     for batch in features.split(batch_size):
         rep = representation(predictor, batch, **kwargs)
         decomposition = quantify(rep)
+        if not isinstance(decomposition, AdditiveDecomposition):
+            msg = f"Expected an additive decomposition (TU = AU + EU), got {type(decomposition).__name__}."
+            raise TypeError(msg)
         out["probabilities"].append(torch.as_tensor(rep.sample_mean().probabilities))
         out["TU"].append(torch.as_tensor(decomposition.total))
         out["AU"].append(torch.as_tensor(decomposition.aleatoric))

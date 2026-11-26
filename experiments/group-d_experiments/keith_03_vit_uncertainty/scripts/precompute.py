@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -32,6 +33,9 @@ from vit_uncertainty.features import (
 )
 from vit_uncertainty.probly_bridge import FeatureLayout, build_methods, make_head
 
+if TYPE_CHECKING:
+    from shapiq.explainer.custom_types import ExplainerIndices
+
 
 def placeholder_predictor(backbones: dict[str, FrozenViT]) -> nn.Module:
     """Random heads with the right shapes; only used to drive the approximators."""
@@ -48,18 +52,22 @@ def explain_and_store(
     predictor: nn.Module,
     image_id: str,
     *,
-    index: str,
+    index: ExplainerIndices,
     max_order: int,
     budget: int,
-    **cache_kwargs: str,
+    players: str = "slic",
+    removal: str = "token",
+    fill: str = "blur",
 ) -> int:
     """Run one explanation so that its coalitions are evaluated, then store them."""
-    cache = coalition_cache(pets, image_id, backbones, **cache_kwargs)
+    cache = coalition_cache(
+        pets, image_id, backbones, players=players, n_players=settings.N_PLAYERS, removal=removal, fill=fill
+    )
     explainer = UncertaintyExplainer(
         backbones,
         predictor,
-        players=cache_kwargs.get("players", "slic"),
-        n_players=cache_kwargs.get("n_players", 16),
+        players=players,
+        n_players=settings.N_PLAYERS,
         index=index,
         max_order=max_order,
         budget=budget,
@@ -93,7 +101,10 @@ def main() -> None:
     test_ids = pets.test[0]
     cohort = [test_ids[i] for i in pets.cohorts["explanation"]]
     subset = [cohort[i] for i in settings.SUBSET_POSITIONS]
-    jobs = [("Hauptkonfiguration", cohort, {"players": "slic", "removal": "token"}, "k-SII", 2, [settings.BUDGET])]
+    # (label, images, cache settings, index, max_order, budgets)
+    jobs: list[tuple[str, list[str], dict[str, str], ExplainerIndices, int, list[int]]] = [
+        ("Hauptkonfiguration", cohort, {"players": "slic", "removal": "token"}, "k-SII", 2, [settings.BUDGET])
+    ]
     jobs.append(("Raster 4x4", subset, {"players": "grid", "removal": "token"}, "k-SII", 2, [settings.BUDGET]))
     jobs.append(
         (

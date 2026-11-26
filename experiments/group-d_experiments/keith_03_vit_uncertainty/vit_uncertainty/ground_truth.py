@@ -35,13 +35,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PIL import Image
 
-from .features import ARTIFACT_DIR, load, save
+from .features import ARTIFACT_DIR, DiskCoalitionFeatures
 from .players import regions_to_tokens
 from .probly_bridge import uncertainty
-from .removal import CoalitionFeatures
 
 if TYPE_CHECKING:
     from torch import nn
+
+    from .removal import CoalitionFeatures
 
 CROP_SIZE = 224
 
@@ -303,15 +304,52 @@ def rank_of(values: np.ndarray, player: int) -> int:
     return int((values > values[player]).sum()) + 1
 
 
+def superpixel_parts(regions: np.ndarray, parts: np.ndarray) -> np.ndarray:
+    """Coarse part of every fine player: the part that covers most of its pixels.
+
+    Used to read fine explanations (16 SLIC superpixels) with the coarse parts of a test image, e.g.
+    which superpixels belong to the pasted head, to the body, or to the background of a chimera.
+
+    Args:
+        regions: Fine player id per pixel (e.g. SLIC superpixels).
+        parts: Coarse player id per pixel (e.g. ``TestImage.players``).
+
+    Returns:
+        ``int64`` array with one coarse id per fine player (ties go to the smaller id).
+    """
+    n_fine, n_parts = int(regions.max()) + 1, int(parts.max()) + 1
+    counts = np.zeros((n_fine, n_parts), dtype=np.int64)
+    np.add.at(counts, (regions.ravel(), parts.ravel()), 1)
+    return counts.argmax(axis=1)
+
+
+def group_pair_sum(pairs: np.ndarray, groups: np.ndarray, a: int, b: int) -> float:
+    """Sum of the pair values between all fine players of group ``a`` and all of group ``b`` (``a != b``).
+
+    For a chimera this adds up every pair "head superpixel x body superpixel": the fine counterpart of
+    the coarse pair Kopf x Körper. If one group has no fine player, the sum is empty and therefore 0.
+
+    Args:
+        pairs: Symmetric matrix of pair values (``UncertaintyExplanation.pairs``).
+        groups: Group of every fine player (:func:`superpixel_parts`).
+        a: First group.
+        b: Second group, different from ``a``.
+    """
+    if a == b:
+        msg = "group_pair_sum needs two different groups."
+        raise ValueError(msg)
+    return float(pairs[np.ix_(groups == a, groups == b)].sum())
+
+
 # ------------------------------------------------------------------------------------ disk cache
 
 
-class StoredCoalitionFeatures(CoalitionFeatures):
-    """:class:`CoalitionFeatures` of a constructed image that remembers its coalitions on disk.
+class StoredCoalitionFeatures(DiskCoalitionFeatures):
+    """:class:`~vit_uncertainty.features.DiskCoalitionFeatures` of a constructed image.
 
     The constructed images are not in the dataset, so the cache key is a hash of the pixels and the
     player map. :meth:`store` writes new coalitions back; a rerun of notebook 03-3 then needs no
-    transformer passes. (A subclass instead of attaching attributes later keeps the types clear.)
+    transformer passes.
 
     Args:
         image: ``uint8`` RGB image.
@@ -322,10 +360,8 @@ class StoredCoalitionFeatures(CoalitionFeatures):
 
     def __init__(self, image: np.ndarray, regions: np.ndarray, backbones: dict, tag: str) -> None:
         """Set up the cache and load matching coalitions from disk."""
-        super().__init__(image, regions, backbones)
         digest = hashlib.sha256(image.tobytes() + regions.astype(np.int64).tobytes()).hexdigest()[:16]
-        self.cache_path = ARTIFACT_DIR / "ground_truth" / f"{tag}_{digest}.pt"
-        self.manifest = {
+        manifest = {
             "schema": 1,
             "digest": digest,
             "models": {
@@ -333,11 +369,15 @@ class StoredCoalitionFeatures(CoalitionFeatures):
                 for key, b in backbones.items()
             },
         }
-        stored = load(self.cache_path)
-        if stored is not None and stored["manifest"] == self.manifest:
-            self.load_state(stored)
+        super().__init__(
+            image,
+            regions,
+            backbones,
+            cache_path=ARTIFACT_DIR / "ground_truth" / f"{tag}_{digest}.pt",
+            manifest=manifest,
+        )
 
     def store(self) -> None:
         """Write all coalitions back to disk, but only if new ones were computed."""
         if self.n_forward:
-            save(self.cache_path, {"manifest": self.manifest, **self.state()})
+            super().store()

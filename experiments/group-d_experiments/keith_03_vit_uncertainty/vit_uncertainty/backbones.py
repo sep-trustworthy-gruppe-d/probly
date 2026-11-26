@@ -1,7 +1,7 @@
 """Frozen vision transformers that can hide patch tokens.
 
-Why two transformers? In the DermaMNIST series (``keith_02_dermamnist``) heads on one frozen network
-agreed almost always, so their epistemic uncertainty (EU) was close to zero. Members that look at
+Why two transformers? In a pilot study on skin images (not in this repository, see the README) heads on
+one frozen network agreed almost always, so their epistemic uncertainty (EU) was close to zero. Members that look at
 the image *differently* disagree more. We therefore use two small transformers that were trained
 in very different ways:
 
@@ -20,7 +20,7 @@ stay where they are. ``tests/test_backbones.py`` checks this equivalence.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
 import torch
@@ -29,7 +29,19 @@ from torch import nn
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-BACKBONES = {
+    from timm.models.vision_transformer import VisionTransformer
+
+
+class BackboneSpec(TypedDict):
+    """How to load one backbone with timm, and how to call it in tables and plots."""
+
+    timm_name: str
+    kwargs: dict[str, Any]  # extra arguments of timm.create_model, e.g. the image size
+    label: str
+    description: str
+
+
+BACKBONES: dict[str, BackboneSpec] = {
     "vit": {
         "timm_name": "vit_small_patch16_224.augreg_in21k_ft_in1k",
         "kwargs": {},
@@ -65,19 +77,27 @@ class FrozenViT(nn.Module):
     ) -> None:
         """Load (or wrap) the transformer and read its patch geometry."""
         super().__init__()
-        if model is None:
-            import timm  # noqa: PLC0415
+        # timm is imported here (not at the top) so that importing the package stays fast.
+        import timm  # noqa: PLC0415
+        from timm.models.vision_transformer import VisionTransformer  # noqa: PLC0415
 
+        if model is None:
             spec = BACKBONES[name]
             # num_classes=0 removes the ImageNet classifier; the model then returns the CLS features.
             model = timm.create_model(spec["timm_name"], pretrained=True, num_classes=0, **spec["kwargs"])
+        # Hiding tokens needs the attention mask of timm's VisionTransformer (both checkpoints are one).
+        # The check also tells the type checker which attributes the model has.
+        if not isinstance(model, VisionTransformer):
+            msg = f"FrozenViT needs a timm VisionTransformer, got {type(model).__name__}."
+            raise TypeError(msg)
         self.name = name
-        self.model = model.requires_grad_(False).eval()
+        self.model: VisionTransformer = model.requires_grad_(False).eval()
         config = getattr(model, "pretrained_cfg", {}) or {}
         self.mean = tuple(mean or config.get("mean", (0.485, 0.456, 0.406)))
         self.std = tuple(std or config.get("std", (0.229, 0.224, 0.225)))
-        self.patch_size = int(model.patch_embed.patch_size[0])
-        self.grid_size = tuple(int(v) for v in model.patch_embed.grid_size)
+        patch_embed = model.patch_embed  # timm's PatchEmbed; its type hint in timm is a plain Callable
+        self.patch_size = int(patch_embed.patch_size[0])
+        self.grid_size = tuple(int(v) for v in patch_embed.grid_size)
         self.n_patches = self.grid_size[0] * self.grid_size[1]
         self.n_prefix = int(model.num_prefix_tokens)  # CLS (and register tokens, if any)
         self.feature_dim = int(model.num_features)
@@ -85,7 +105,8 @@ class FrozenViT(nn.Module):
     @property
     def label(self) -> str:
         """Readable model name for tables and plots."""
-        return BACKBONES.get(self.name, {}).get("label", self.name)
+        spec = BACKBONES.get(self.name)
+        return self.name if spec is None else spec["label"]
 
     def normalize(self, images: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Convert ``uint8`` images ``(N, H, W, 3)`` to normalized float tensors ``(N, 3, H, W)``."""

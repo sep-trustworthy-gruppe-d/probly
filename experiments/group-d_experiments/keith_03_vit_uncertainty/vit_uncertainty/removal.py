@@ -8,7 +8,7 @@ two apart:
 * the games in :mod:`vit_uncertainty.game` turn features into P, TU, AU or EU.
 
 With the cache, the four games of one image (P, TU, AU, EU) and all probly methods share the same
-forward passes. This was the key lesson of the DermaMNIST series: separating "evaluate coalitions"
+forward passes. This was the key lesson of our pilot study: separating "evaluate coalitions"
 from "measure uncertainty" makes explanations of uncertainty affordable.
 
 Two ways to remove a player are supported:
@@ -89,11 +89,11 @@ class CoalitionFeatures:
     def _compute(self, coalitions: np.ndarray) -> torch.Tensor:
         blocks = {}
         for name, backbone in self.backbones.items():
-            if self.removal == "token":
+            if self._filled is None:  # removal == "token": hide the patch tokens of absent players
                 visible = token_coalition_mask(coalitions, self.token_players[name])
                 images = np.repeat(self.image[None], len(coalitions), axis=0)
                 blocks[name] = backbone.features(images, visible, batch_size=self.batch_size)
-            else:
+            else:  # removal == "fill": paint the pixels of absent players with the fill image
                 keep = pixel_coalition_mask(coalitions, self.regions)[..., None]
                 images = np.where(keep, self.image[None], self._filled[None]).astype(np.uint8)
                 blocks[name] = backbone.features(images, batch_size=self.batch_size)

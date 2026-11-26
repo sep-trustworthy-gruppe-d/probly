@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 import shapiq
@@ -10,8 +12,16 @@ import torch
 from vit_uncertainty.amortized import AmortizedUncertaintyExplainer, efficient, player_tokens
 from vit_uncertainty.explainer import UncertaintyExplainer
 from vit_uncertainty.game import UncertaintyGame
+from vit_uncertainty.ground_truth import coalition_table, moebius_pair
 from vit_uncertainty.players import make_regions
-from vit_uncertainty.probly_bridge import uncertainty
+from vit_uncertainty.probly_bridge import (
+    FeatureLayout,
+    build_probly_dropout,
+    build_probly_ensemble,
+    make_head,
+    member,
+    uncertainty,
+)
 from vit_uncertainty.removal import CoalitionFeatures
 
 
@@ -140,3 +150,116 @@ def test_amortized_explainer_recovers_an_additive_game() -> None:
     phi = explainer.explain(tokens, token_players, data["full"], data["empty"])
     error = np.abs(phi - weights.numpy()).mean() / np.abs(weights.numpy()).mean()
     assert error < 0.1
+
+
+# ------------------------------------------------------------------ probly construction (since 25.11.)
+
+
+def _entropy(p: torch.Tensor) -> torch.Tensor:
+    return -(p * p.log()).sum(-1)
+
+
+def test_mixed_ensemble_is_a_probly_ensemble_of_logit_classifiers(backbones, image) -> None:
+    """For probly, the mixed ensemble is a ModuleList of logit classifiers; P, TU, AU match a hand computation."""
+    from probly.method.ensemble import EnsemblePredictor  # noqa: PLC0415
+    from probly.predictor import LogitClassifier  # noqa: PLC0415
+
+    layout = FeatureLayout.from_backbones(backbones)
+    members = [
+        member(layout, name, make_head(32, 5, seed=seed).state_dict()).double()
+        for name, seed in (("vit", 0), ("vit", 1), ("dinov2", 2))
+    ]
+    ensemble = build_probly_ensemble(members)
+    assert isinstance(ensemble, EnsemblePredictor)
+    assert all(isinstance(m, LogitClassifier) for m in ensemble)
+    features = torch.cat([b.features(image[None]) for b in backbones.values()], dim=1).double()
+    scores = uncertainty(ensemble, features)
+    with torch.no_grad():
+        p = torch.stack([m(features).softmax(-1) for m in members])  # (members, 1, classes)
+    mean = p.mean(0)
+    np.testing.assert_allclose(scores["probabilities"], mean.numpy(), atol=1e-12)
+    np.testing.assert_allclose(scores["TU"], _entropy(mean).numpy(), atol=1e-12)
+    np.testing.assert_allclose(scores["AU"], _entropy(p).mean(0).numpy(), atol=1e-12)
+
+
+def test_dropout_equals_probly_with_predictor_type(backbones, image) -> None:
+    """Registering the head ourselves gives exactly what ``predictor_type="logit_classifier"`` gives."""
+    from probly.method import dropout  # noqa: PLC0415
+
+    layout = FeatureLayout.from_backbones(backbones)
+    state = make_head(32, 5, seed=3).state_dict()
+    ours = build_probly_dropout(member(layout, "vit", state).double(), p=0.5)
+    # The keyword is added by probly's decorator; passed as a dict, the type checker needs no stubs.
+    keyword: dict[str, Any] = {"predictor_type": "logit_classifier"}
+    reference = dropout(member(layout, "vit", state).double(), p=0.5, **keyword).eval()
+    features = torch.cat([b.features(image[None]) for b in backbones.values()], dim=1).double()
+    for key, value in uncertainty(ours, features, num_samples=20).items():
+        np.testing.assert_array_equal(value, uncertainty(reference, features, num_samples=20)[key])
+
+
+# ------------------------------------------------------------------------ indices (since 25.11.)
+
+
+def test_fsii_reuses_the_coalitions_of_k_sii(methods, backbones, image) -> None:
+    """FSII (RegressionFSII) asks for the same coalitions as k-SII: no new transformer passes."""
+    regions = make_regions(image, "slic", 16)
+    cache = CoalitionFeatures(image, regions, backbones)
+    explanations = {
+        index: UncertaintyExplainer(
+            backbones, methods["Gemischt"], players="slic", n_players=16, index=index, budget=300
+        ).explain(image, regions=regions, coalition_features=cache)
+        for index in ("k-SII", "FSII")
+    }
+    fsii = explanations["FSII"]
+    assert fsii.n_forward == 0
+    assert fsii.values["EU"].index == "FSII"
+    np.testing.assert_allclose(fsii.pairs("TU"), fsii.pairs("AU") + fsii.pairs("EU"), atol=1e-6)
+
+
+def test_exact_indices_agree_for_two_players(methods, backbones, image) -> None:
+    """With two players every order-2 index gives the same pair: v(12) - v(1) - v(2) + v(empty)."""
+    regions = np.zeros(image.shape[:2], dtype=np.int64)
+    regions[:, 112:] = 1
+    cache = CoalitionFeatures(image, regions, backbones)
+    pairs = {}
+    for index in ("k-SII", "STII", "FSII", "Moebius"):
+        explainer = UncertaintyExplainer(backbones, methods["Gemischt"], index=index, max_order=2, budget=4)
+        pairs[index] = explainer.explain(image, regions=regions, coalition_features=cache).pairs("EU")[0, 1]
+    table = coalition_table(cache, methods["Gemischt"], target_class=0)
+    for value in pairs.values():
+        assert value == pytest.approx(moebius_pair(table, "EU", 0, 1), abs=1e-12)
+
+
+def test_exact_indices_share_the_three_way_term_differently(methods, backbones, image) -> None:
+    """With three players the indices differ only in how they share the three-way Moebius term m(012).
+
+    Pair (0, 1): Moebius keeps m(01); k-SII and FSII add half of m(012), STII a third. All stay linear,
+    so pair(TU) = pair(AU) + pair(EU) for every index.
+    """
+    regions = make_regions(image, "grid", 4)
+    regions[regions == 3] = 2  # three players
+    cache = CoalitionFeatures(image, regions, backbones)
+    explanations = {
+        index: UncertaintyExplainer(backbones, methods["Gemischt"], index=index, max_order=2, budget=8).explain(
+            image, regions=regions, coalition_features=cache
+        )
+        for index in ("k-SII", "STII", "FSII", "Moebius")
+    }
+    moebius = explanations["Moebius"].values["EU"]
+    pair, three_way = moebius[(0, 1)], moebius[(0, 1, 2)]
+    share = {"k-SII": 1 / 2, "FSII": 1 / 2, "STII": 1 / 3, "Moebius": 0.0}
+    for index, explanation in explanations.items():
+        assert explanation.pairs("EU")[0, 1] == pytest.approx(pair + share[index] * three_way, abs=1e-12)
+        np.testing.assert_allclose(
+            explanation.pairs("TU"), explanation.pairs("AU") + explanation.pairs("EU"), atol=1e-10
+        )
+    assert cache.n_forward == 8
+
+
+def test_approximated_stii_is_refused(methods, backbones, image) -> None:
+    """STII has no regression approximator here; with too small a budget the explainer says so."""
+    explainer = UncertaintyExplainer(
+        backbones, methods["Gemischt"], players="grid", n_players=9, index="STII", budget=64
+    )
+    with pytest.raises(ValueError, match="No approximator"):
+        explainer.explain(image)
